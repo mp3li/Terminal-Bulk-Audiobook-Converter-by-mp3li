@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "title": "Example Audiobook",
+    "author": "Example Author",
+    "narrator": "Example Narrator",
+    "description": "Short description of the audiobook.",
+    "publisher": {
+      "name": "Example Publisher"
+    }
+  },
+  "loan": {
+    "publishDate": "2026-01-01T00:00:00Z",
+    "subjects": [
+      {
+        "name": "Audiobook"
+      },
+      {
+        "name": "Fiction"
+      }
+    ],
+    "detailedSeries": {
+      "seriesName": "Example Series",
+      "readingOrder": "1"
+    }
+  }
+}
