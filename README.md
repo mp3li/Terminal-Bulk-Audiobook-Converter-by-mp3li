@@ -24,6 +24,7 @@ Terminal Bulk Audiobook Converter is a local terminal tool that converts folder-
 - Keeps the original audio parts, cover image, and metadata file untouched.
 - Embeds cover art into the `.m4b`.
 - Applies metadata from `metadata.json`.
+- Verifies the finished `.m4b` before accepting it as done.
 - Sorts numbered audiobook parts in natural order, so filenames like `Part 1`, `Part 02`, and `Part 003` work correctly.
 - Lets you stop and run again later.
   - Completed `.m4b` files stay finished.
@@ -147,9 +148,9 @@ If you use winget:
 
 Each audiobook must be in its own folder.
 
-Each audiobook folder should include:
+Each audiobook folder must include:
 
-- numbered audio parts
+- every numbered audio part for that book
 - a cover image named `cover.jpg`, `cover.jpeg`, `cover.png`, `folder.jpg`, `folder.jpeg`, or `folder.png`
 - a `metadata.json` file
 
@@ -173,6 +174,8 @@ Supported audio input file types:
 - `.wav`
 - `.flac`
 - `.ogg`
+
+The tool scans inside each audiobook folder recursively, so audio parts may be inside nested folders. It still treats one top-level folder as one book.
 
 --------------------------------------------------
 
@@ -292,6 +295,8 @@ The tool expects a `metadata.json` file in each audiobook folder.
 
 It supports metadata commonly exported from library/archive tools, including nested `meta` and `loan` objects.
 
+If a folder is missing `metadata.json` or a supported cover image, it is skipped instead of being converted. This prevents creating `.m4b` files without required metadata or cover art.
+
 Common fields used:
 
 - `meta.title`
@@ -322,6 +327,13 @@ Dune Messiah by Frank Herbert/
 ```
 
 The tool does not delete your original source files.
+
+Before a new `.m4b` is accepted, the tool checks that:
+
+- every discovered audio part was readable before conversion
+- the output duration is at least 98% of the full source duration
+- cover art is embedded when a cover image was provided
+- title metadata is present
 
 --------------------------------------------------
 

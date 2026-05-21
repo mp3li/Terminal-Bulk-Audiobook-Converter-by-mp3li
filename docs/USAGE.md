@@ -4,9 +4,9 @@
 
 Put each audiobook in its own folder. The folder name should be readable, ideally `Title by Author`.
 
-Each folder should contain:
+Each folder must contain:
 
-- Numbered audio parts, such as `.mp3`, `.m4a`, `.aac`, `.wav`, `.flac`, or `.ogg`
+- Every numbered audio part for that book, such as `.mp3`, `.m4a`, `.aac`, `.wav`, `.flac`, or `.ogg`
 - A cover image named `cover.jpg`, `cover.jpeg`, `cover.png`, `folder.jpg`, `folder.jpeg`, or `folder.png`
 - A `metadata.json` file
 
@@ -20,6 +20,8 @@ My Audiobooks/
     cover.jpg
     metadata.json
 ```
+
+The tool scans inside each audiobook folder recursively, so parts may be inside nested folders. A book is skipped if it is missing `metadata.json`, missing a supported cover image, or missing audio files.
 
 ## 2. Run a Dry Run First
 
@@ -44,6 +46,8 @@ Then choose:
 ```
 
 The dashboard shows total completed audiobooks and current per-book percentages.
+
+The tool only accepts a finished `.m4b` when the output duration matches the full source duration closely, the cover is embedded, and title metadata is present.
 
 ## 4. Stop and Resume
 

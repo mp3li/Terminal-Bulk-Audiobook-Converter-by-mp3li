@@ -5,18 +5,24 @@ import json
 import re
 import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg"}
 COVER_NAMES = ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.jpeg", "folder.png")
 STATUS_FILENAME = ".m4b_batch_status.json"
+MIN_OUTPUT_DURATION_RATIO = 0.98
 
 
 def natural_key(path: Path) -> list:
-    parts = re.split(r"(\d+)", path.name.casefold())
+    parts = re.split(r"(\d+)", str(path).casefold())
     return [int(part) if part.isdigit() else part for part in parts]
+
+
+def audio_sort_key(path: Path, root: Path) -> tuple:
+    relative = path.relative_to(root)
+    numbers = tuple(int(part) for part in re.findall(r"\d+", str(relative)))
+    return numbers, natural_key(relative)
 
 
 def clean_text(value) -> str | None:
@@ -34,6 +40,14 @@ def safe_filename(name: str) -> str:
     return name or "Audiobook"
 
 
+def infer_title_author(folder: Path) -> tuple[str, str | None]:
+    name = folder.name.replace(" (Audiobook)", "").strip()
+    match = re.match(r"(.+?)\s+by\s+(.+)", name, flags=re.IGNORECASE)
+    if match:
+        return clean_text(match.group(1)) or name, clean_text(match.group(2))
+    return name or "Audiobook", None
+
+
 def short_text(text: str, max_length: int = 88) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) <= max_length:
@@ -43,6 +57,19 @@ def short_text(text: str, max_length: int = 88) -> str:
 
 def load_metadata(folder: Path) -> dict:
     metadata_path = folder / "metadata.json"
+    inferred_title, inferred_author = infer_title_author(folder)
+
+    if not metadata_path.exists():
+        tags = {
+            "title": inferred_title,
+            "album": inferred_title,
+            "artist": inferred_author,
+            "album_artist": inferred_author,
+            "composer": inferred_author,
+            "genre": "Audiobook",
+        }
+        return {key: value for key, value in tags.items() if value}
+
     with metadata_path.open("r", encoding="utf-8") as handle:
         raw = json.load(handle)
 
@@ -58,8 +85,8 @@ def load_metadata(folder: Path) -> dict:
     subjects = loan.get("subjects") or []
     genres = [item.get("name") for item in subjects if isinstance(item, dict) and item.get("name")]
 
-    title = clean_text(meta.get("title") or loan.get("title") or folder.name.replace(" (Audiobook)", ""))
-    author = clean_text(meta.get("author") or loan.get("firstCreatorName"))
+    title = clean_text(meta.get("title") or loan.get("title") or inferred_title)
+    author = clean_text(meta.get("author") or loan.get("firstCreatorName") or inferred_author)
     narrator = clean_text(meta.get("narrator"))
     description = clean_text(meta.get("description"))
     series = clean_text(meta.get("series") or loan.get("series") or detailed_series.get("seriesName"))
@@ -93,10 +120,23 @@ def find_cover(folder: Path) -> Path | None:
         candidate = folder / name
         if candidate.exists():
             return candidate
-    for candidate in sorted(folder.iterdir(), key=natural_key):
-        if candidate.suffix.casefold() in {".jpg", ".jpeg", ".png"}:
+    for candidate in sorted(folder.rglob("*"), key=lambda path: natural_key(path.relative_to(folder))):
+        if candidate.is_file() and candidate.suffix.casefold() in {".jpg", ".jpeg", ".png"}:
             return candidate
     return None
+
+
+def find_audio_files(folder: Path) -> list[Path]:
+    return sorted(
+        [
+            path
+            for path in folder.rglob("*")
+            if path.is_file()
+            and path.suffix.casefold() in AUDIO_EXTENSIONS
+            and not any(part.startswith(".") for part in path.relative_to(folder).parts)
+        ],
+        key=lambda path: audio_sort_key(path, folder),
+    )
 
 
 def audiobook_jobs(root: Path) -> tuple[list[dict], list[str]]:
@@ -123,10 +163,7 @@ def audiobook_jobs(root: Path) -> tuple[list[dict], list[str]]:
             skipped.append(f"{folder.name} - missing metadata.json")
             continue
 
-        audio_files = sorted(
-            [path for path in folder.iterdir() if path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS],
-            key=natural_key,
-        )
+        audio_files = find_audio_files(folder)
         if not audio_files:
             skipped.append(f"{folder.name} - no audio files found")
             continue
@@ -152,10 +189,6 @@ def audiobook_jobs(root: Path) -> tuple[list[dict], list[str]]:
     return jobs, skipped
 
 
-def ffmpeg_escape(path: Path) -> str:
-    return str(path).replace("'", "'\\''")
-
-
 async def media_duration_seconds(path: Path) -> float:
     process = await asyncio.create_subprocess_exec(
         "ffprobe",
@@ -179,13 +212,70 @@ async def media_duration_seconds(path: Path) -> float:
         return 0.0
 
 
-async def job_duration_seconds(job: dict) -> float:
-    total = 0.0
+async def job_audio_durations(job: dict) -> list[tuple[Path, float]]:
+    durations = []
     for path in job["audio_files"]:
-        duration = await media_duration_seconds(path)
-        if duration > 0:
-            total += duration
-    return total
+        durations.append((path, await media_duration_seconds(path)))
+    return durations
+
+
+async def media_probe(path: Path) -> dict:
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await process.communicate()
+    if process.returncode != 0:
+        return {}
+
+    try:
+        return json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {}
+
+
+async def validate_output(job: dict, output: Path, expected_duration: float) -> tuple[bool, str]:
+    probe = await media_probe(output)
+    output_duration = 0.0
+    try:
+        output_duration = float((probe.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        output_duration = 0.0
+
+    if expected_duration > 0:
+        required_duration = expected_duration * MIN_OUTPUT_DURATION_RATIO
+        if output_duration < required_duration:
+            return (
+                False,
+                f"output is too short ({output_duration:.1f}s created, {expected_duration:.1f}s expected)",
+            )
+
+    if job["cover"] is not None:
+        streams = probe.get("streams") or []
+        has_cover = any(
+            stream.get("codec_type") == "video"
+            and (stream.get("disposition") or {}).get("attached_pic") == 1
+            for stream in streams
+        )
+        if not has_cover:
+            return False, "cover image was not embedded"
+
+    expected_title = job["metadata"].get("title")
+    if expected_title:
+        tags = (probe.get("format") or {}).get("tags") or {}
+        found_title = tags.get("title") or tags.get("TITLE")
+        if found_title != expected_title:
+            return False, "title metadata was not embedded"
+
+    return True, ""
 
 
 def write_status_file(root: Path, jobs: list[dict], completed: int, failed: int, active: dict) -> None:
@@ -204,45 +294,61 @@ def maybe_write_status_file(root: Path, jobs: list[dict], completed: int, failed
         write_status_file(root, jobs, completed, failed, active)
 
 
-def build_command(job: dict, concat_path: Path, partial_output: Path, audio_bitrate: str) -> list[str]:
+def build_command(job: dict, partial_output: Path, audio_bitrate: str) -> list[str]:
     command = [
         "ffmpeg",
         "-hide_banner",
         "-nostats",
         "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_path),
-        "-i",
-        str(job["cover"]),
-        "-map",
-        "0:a",
-        "-map",
-        "1:v",
-        "-c:a",
-        "aac",
-        "-b:a",
-        audio_bitrate,
-        "-c:v",
-        "copy",
-        "-disposition:v:0",
-        "attached_pic",
-        "-movflags",
-        "+faststart+use_metadata_tags",
     ]
+
+    for path in job["audio_files"]:
+        command.extend(["-i", str(path)])
+
+    cover_index = None
+    if job["cover"] is not None:
+        cover_index = len(job["audio_files"])
+        command.extend(["-i", str(job["cover"])])
+
+    audio_inputs = "".join(f"[{index}:a:0]" for index in range(len(job["audio_files"])))
+    command.extend(
+        [
+            "-filter_complex",
+            f"{audio_inputs}concat=n={len(job['audio_files'])}:v=0:a=1[aout]",
+            "-map",
+            "[aout]",
+            "-c:a",
+            "aac",
+            "-b:a",
+            audio_bitrate,
+        ]
+    )
+
+    if cover_index is not None:
+        cover_codec = "copy" if job["cover"].suffix.casefold() in {".jpg", ".jpeg"} else "mjpeg"
+        command.extend(
+            [
+                "-map",
+                f"{cover_index}:v:0",
+                "-c:v",
+                cover_codec,
+                "-disposition:v:0",
+                "attached_pic",
+            ]
+        )
+
+    command.extend(
+        [
+            "-movflags",
+            "+faststart",
+        ]
+    )
 
     for key, value in job["metadata"].items():
         command.extend(["-metadata", f"{key}={value}"])
 
     command.extend(
         [
-            "-metadata:s:v",
-            "title=Cover",
-            "-metadata:s:v",
-            "comment=Cover (front)",
             "-f",
             "mp4",
             "-progress",
@@ -250,6 +356,13 @@ def build_command(job: dict, concat_path: Path, partial_output: Path, audio_bitr
             str(partial_output),
         ]
     )
+    if cover_index is not None:
+        command[-5:-5] = [
+            "-metadata:s:v",
+            "title=Cover",
+            "-metadata:s:v",
+            "comment=Cover (front)",
+        ]
     return command
 
 
@@ -273,58 +386,57 @@ async def run_ffmpeg(job: dict, args: argparse.Namespace, progress_queue: asynci
     if partial_output.exists():
         partial_output.unlink()
 
-    with tempfile.TemporaryDirectory(prefix="m4b_", dir=folder) as tmp_dir:
-        concat_path = Path(tmp_dir) / "inputs.txt"
-        concat_path.write_text(
-            "".join(f"file '{ffmpeg_escape(path.resolve())}'\n" for path in job["audio_files"]),
-            encoding="utf-8",
-        )
+    command = build_command(job, partial_output, args.audio_bitrate)
+    if args.dry_run:
+        return True, f"DRY RUN: would create {output.name}"
 
-        command = build_command(job, concat_path, partial_output, args.audio_bitrate)
-        if args.dry_run:
-            return True, f"DRY RUN: would create {output.name}"
+    audio_durations = await job_audio_durations(job)
+    unreadable = [path.name for path, duration in audio_durations if duration <= 0]
+    if unreadable:
+        await progress_queue.put((folder.name, "failed", 0.0, f"FAILED: {folder.name}"))
+        return False, f"FAILED: {folder.name}\nCould not read duration for: {', '.join(unreadable)}"
 
-        total_duration = await job_duration_seconds(job)
-        await progress_queue.put((folder.name, "started", 0.0, ""))
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stderr_task = asyncio.create_task(read_stderr(process))
+    total_duration = sum(duration for _, duration in audio_durations)
+    await progress_queue.put((folder.name, "started", 0.0, ""))
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stderr_task = asyncio.create_task(read_stderr(process))
 
-        try:
-            if process.stdout is not None:
-                while True:
-                    line = await process.stdout.readline()
-                    if not line:
-                        break
-                    text = line.decode("utf-8", errors="replace").strip()
-                    if text.startswith("out_time_ms=") and total_duration > 0:
-                        try:
-                            out_time_seconds = int(text.split("=", 1)[1]) / 1_000_000
-                        except ValueError:
-                            continue
-                        percent = min(99.9, (out_time_seconds / total_duration) * 100)
-                        await progress_queue.put((folder.name, "progress", percent, ""))
-                    elif text == "progress=end":
-                        await progress_queue.put((folder.name, "progress", 100.0, ""))
+    try:
+        if process.stdout is not None:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if text.startswith("out_time_ms=") and total_duration > 0:
+                    try:
+                        out_time_seconds = int(text.split("=", 1)[1]) / 1_000_000
+                    except ValueError:
+                        continue
+                    percent = min(99.9, (out_time_seconds / total_duration) * 100)
+                    await progress_queue.put((folder.name, "progress", percent, ""))
+                elif text == "progress=end":
+                    await progress_queue.put((folder.name, "progress", 100.0, ""))
 
-            await process.wait()
-            stderr = await stderr_task
-        except asyncio.CancelledError:
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-            stderr_task.cancel()
-            if partial_output.exists():
-                partial_output.unlink()
-            await progress_queue.put((folder.name, "cancelled", 0.0, f"CANCELLED: {folder.name}"))
-            raise
+        await process.wait()
+        stderr = await stderr_task
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+        stderr_task.cancel()
+        if partial_output.exists():
+            partial_output.unlink()
+        await progress_queue.put((folder.name, "cancelled", 0.0, f"CANCELLED: {folder.name}"))
+        raise
 
     if process.returncode != 0:
         if partial_output.exists():
@@ -332,6 +444,13 @@ async def run_ffmpeg(job: dict, args: argparse.Namespace, progress_queue: asynci
         message = stderr
         await progress_queue.put((folder.name, "failed", 0.0, f"FAILED: {folder.name}"))
         return False, f"FAILED: {folder.name}\n{message}"
+
+    valid, validation_message = await validate_output(job, partial_output, total_duration)
+    if not valid:
+        if partial_output.exists():
+            partial_output.unlink()
+        await progress_queue.put((folder.name, "failed", 0.0, f"FAILED: {folder.name}"))
+        return False, f"FAILED: {folder.name}\n{validation_message}"
 
     partial_output.replace(output)
     await progress_queue.put((folder.name, "done", 100.0, f"DONE: {folder.name} -> {output.name}"))
