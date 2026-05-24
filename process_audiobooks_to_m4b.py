@@ -5,6 +5,8 @@ import json
 import re
 import shutil
 import sys
+import termios
+import tty
 from pathlib import Path
 
 
@@ -139,15 +141,22 @@ def find_audio_files(folder: Path) -> list[Path]:
     )
 
 
-def audiobook_jobs(root: Path) -> tuple[list[dict], list[str]]:
+def audiobook_jobs(root: Path) -> tuple[list[dict], list[str], dict]:
     jobs = []
     skipped = []
+    summary = {
+        "total_folders": 0,
+        "needs_conversion": 0,
+        "already_converted": 0,
+        "not_ready": 0,
+    }
 
     audiobook_folders = [
         path
         for path in root.iterdir()
         if path.is_dir() and not path.name.startswith(".") and path.name != "__pycache__"
     ]
+    summary["total_folders"] = len(audiobook_folders)
 
     for folder in sorted(audiobook_folders, key=natural_key):
         existing_m4b = sorted(
@@ -155,21 +164,25 @@ def audiobook_jobs(root: Path) -> tuple[list[dict], list[str]]:
             key=natural_key,
         )
         if existing_m4b:
+            summary["already_converted"] += 1
             skipped.append(f"{folder.name} - already has {existing_m4b[0].name}")
             continue
 
         metadata_path = folder / "metadata.json"
         if not metadata_path.exists():
+            summary["not_ready"] += 1
             skipped.append(f"{folder.name} - missing metadata.json")
             continue
 
         audio_files = find_audio_files(folder)
         if not audio_files:
+            summary["not_ready"] += 1
             skipped.append(f"{folder.name} - no audio files found")
             continue
 
         cover = find_cover(folder)
         if cover is None:
+            summary["not_ready"] += 1
             skipped.append(f"{folder.name} - missing cover image")
             continue
 
@@ -186,7 +199,8 @@ def audiobook_jobs(root: Path) -> tuple[list[dict], list[str]]:
             }
         )
 
-    return jobs, skipped
+    summary["needs_conversion"] = len(jobs)
+    return jobs, skipped, summary
 
 
 async def media_duration_seconds(path: Path) -> float:
@@ -383,12 +397,13 @@ async def run_ffmpeg(job: dict, args: argparse.Namespace, progress_queue: asynci
     output = job["output"]
     partial_output = output.with_name(f"{output.stem}.partial{output.suffix}")
 
+    if args.dry_run:
+        return True, f"DRY RUN: would create {output.name}"
+
     if partial_output.exists():
         partial_output.unlink()
 
     command = build_command(job, partial_output, args.audio_bitrate)
-    if args.dry_run:
-        return True, f"DRY RUN: would create {output.name}"
 
     audio_durations = await job_audio_durations(job)
     unreadable = [path.name for path, duration in audio_durations if duration <= 0]
@@ -561,64 +576,119 @@ async def process_jobs(jobs: list[dict], args: argparse.Namespace) -> int:
     completed = 0
     failed = 0
     root = Path(args.root).expanduser().resolve()
+    next_job_index = 0
+    tasks = {}
+    progress_queue = asyncio.Queue()
+    progress_waiter = None
+    dashboard_lines = 0
+    labels = {}
+    progress = {}
+    states = {}
 
-    for batch_start in range(0, total, args.parallel):
-        batch = jobs[batch_start : batch_start + args.parallel]
-        if args.dry_run:
-            print("\nNow processing:")
-            for job in batch:
-                print(f"  - {job['label']}")
-            print(flush=True)
-
-        active = {
-            job["folder"].name: {
-                "percent": 0.0,
-                "output": str(job["output"]),
-                "label": job["label"],
+    def active_status() -> dict:
+        return {
+            name: {
+                "percent": round(progress[name], 1),
+                "state": states[name],
+                "label": labels[name],
             }
-            for job in batch
+            for name in progress
         }
-        maybe_write_status_file(root, jobs, completed, failed, active, args)
 
-        progress_queue = asyncio.Queue()
-        tasks = [asyncio.create_task(run_ffmpeg(job, args, progress_queue)) for job in batch]
-        progress_task = None
-        if not args.dry_run:
-            progress_task = asyncio.create_task(
-                show_live_progress(
-                    progress_queue,
-                    batch,
-                    root,
-                    jobs,
-                    completed,
-                    failed,
-                    args,
-                )
+    def start_next_job() -> bool:
+        nonlocal next_job_index
+        if next_job_index >= total:
+            return False
+
+        job = jobs[next_job_index]
+        next_job_index += 1
+        name = job["folder"].name
+        labels[name] = job["label"]
+        progress[name] = 0.0
+        states[name] = "waiting"
+        if args.dry_run or not sys.stdout.isatty():
+            print(f"\nNow processing:\n  - {job['label']}", flush=True)
+        task = asyncio.create_task(run_ffmpeg(job, args, progress_queue))
+        tasks[task] = job
+        return True
+
+    for _ in range(min(args.parallel, total)):
+        start_next_job()
+
+    maybe_write_status_file(root, jobs, completed, failed, active_status(), args)
+
+    try:
+        while tasks:
+            if not args.dry_run and sys.stdout.isatty() and dashboard_lines == 0 and progress:
+                dashboard_lines = render_dashboard(progress, states, labels, completed, failed, total)
+
+            if progress_waiter is None:
+                progress_waiter = asyncio.create_task(progress_queue.get())
+
+            done, _ = await asyncio.wait(
+                [*tasks.keys(), progress_waiter],
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=2,
             )
 
-        try:
-            results = await asyncio.gather(*tasks)
-            if progress_task is not None:
-                await progress_task
-        except asyncio.CancelledError:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if progress_task is not None:
-                progress_task.cancel()
-                await asyncio.gather(progress_task, return_exceptions=True)
-            maybe_write_status_file(root, jobs, completed, failed, {}, args)
-            raise
+            if not done:
+                if not args.dry_run and sys.stdout.isatty() and progress:
+                    clear_dashboard(dashboard_lines)
+                    dashboard_lines = render_dashboard(progress, states, labels, completed, failed, total)
+                    maybe_write_status_file(root, jobs, completed, failed, active_status(), args)
+                continue
 
-        for ok, message in results:
-            completed += 1
-            if not ok:
-                failed += 1
-            percent = (completed / total) * 100 if total else 100
-            if args.dry_run or not sys.stdout.isatty():
-                print(message)
-                print(f"Progress: {completed}/{total} finished ({percent:.1f}%)", flush=True)
-            maybe_write_status_file(root, jobs, completed, failed, {}, args)
+            if progress_waiter in done:
+                name, state, percent, _ = progress_waiter.result()
+                progress_waiter = None
+                if name in progress:
+                    states[name] = state
+                    progress[name] = percent
+
+            finished_tasks = [task for task in done if task in tasks]
+            for task in finished_tasks:
+                job = tasks.pop(task)
+                name = job["folder"].name
+                ok, message = task.result()
+                completed += 1
+                if not ok:
+                    failed += 1
+
+                if name in progress:
+                    del progress[name]
+                    del states[name]
+                    del labels[name]
+
+                if not args.dry_run and sys.stdout.isatty():
+                    clear_dashboard(dashboard_lines)
+                    dashboard_lines = 0
+                    print(message, flush=True)
+                else:
+                    percent = (completed / total) * 100 if total else 100
+                    print(message)
+                    print(f"Progress: {completed}/{total} finished ({percent:.1f}%)", flush=True)
+
+                start_next_job()
+                maybe_write_status_file(root, jobs, completed, failed, active_status(), args)
+
+            if not args.dry_run and sys.stdout.isatty() and progress:
+                clear_dashboard(dashboard_lines)
+                dashboard_lines = render_dashboard(progress, states, labels, completed, failed, total)
+                maybe_write_status_file(root, jobs, completed, failed, active_status(), args)
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        if progress_waiter is not None:
+            progress_waiter.cancel()
+        await asyncio.gather(*tasks.keys(), return_exceptions=True)
+        maybe_write_status_file(root, jobs, completed, failed, {}, args)
+        raise
+    finally:
+        if progress_waiter is not None:
+            progress_waiter.cancel()
+            await asyncio.gather(progress_waiter, return_exceptions=True)
+        if dashboard_lines:
+            clear_dashboard(dashboard_lines)
 
     if failed:
         print(f"\nFinished with {failed} failed audiobook(s).")
@@ -657,7 +727,52 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def confirm_start() -> bool:
+def print_scan_summary(summary: dict, skipped: list[str]) -> None:
+    print()
+    print(f"Found {summary['total_folders']} audiobook folder(s) total.")
+    print(f"{summary['needs_conversion']} need m4b conversion.")
+    print(f"{summary['already_converted']} already have m4b files.")
+    if summary["not_ready"]:
+        print(f"{summary['not_ready']} are missing something needed for conversion.")
+    print()
+
+    if skipped:
+        print(f"Skipped {len(skipped)} folder(s):")
+        for item in skipped:
+            print(f"  - {item}")
+        print()
+
+
+def read_menu_choice() -> str:
+    if not sys.stdin.isatty():
+        return input("> ").strip()
+
+    print("> ", end="", flush=True)
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    typed = []
+    try:
+        tty.setcbreak(fd)
+        while True:
+            char = sys.stdin.read(1)
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char in {"\n", "\r"}:
+                print()
+                return "".join(typed).strip()
+            if char in {"\x7f", "\b"}:
+                if typed:
+                    typed.pop()
+                    print("\b \b", end="", flush=True)
+                continue
+            if char.isprintable():
+                typed.append(char)
+                print(char, end="", flush=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def confirm_start(summary: dict, skipped: list[str]) -> bool:
     print()
     print("Welcome to Terminal Bulk Audiobook m4b Tool by mp3li")
     print()
@@ -676,6 +791,7 @@ def confirm_start() -> bool:
     )
     print()
     print("Any audiobook that was mid-conversion will restart on the next run.")
+    print_scan_summary(summary, skipped)
     print()
     print("Do you wish to start converting?")
     print()
@@ -684,7 +800,7 @@ def confirm_start() -> bool:
     print()
 
     while True:
-        choice = input("> ").strip()
+        choice = read_menu_choice()
         if choice == "1":
             print()
             return True
@@ -711,19 +827,13 @@ def main() -> int:
         print("ffmpeg and ffprobe must both be available on PATH.", file=sys.stderr)
         return 2
 
-    if not confirm_start():
+    jobs, skipped, summary = audiobook_jobs(root)
+    if not jobs:
+        print_scan_summary(summary, skipped)
+        print("Nothing to process.")
         return 0
 
-    jobs, skipped = audiobook_jobs(root)
-
-    print(f"Found {len(jobs)} audiobook folder(s) needing m4b files.")
-    if skipped:
-        print(f"Skipped {len(skipped)} folder(s):")
-        for item in skipped:
-            print(f"  - {item}")
-
-    if not jobs:
-        print("Nothing to process.")
+    if not confirm_start(summary, skipped):
         return 0
 
     try:
