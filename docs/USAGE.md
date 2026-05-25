@@ -4,11 +4,17 @@
 
 Put each audiobook in its own folder. The folder name should be readable, ideally `Title by Author`.
 
-Each folder must contain:
+The tool only works on audiobook folders that existed when it launched. You can add more audiobook folders while metadata or conversion is running, and those new folders wait until the next run.
+
+Do not edit, rename, move, or delete a folder that is currently being processed.
+
+For conversion-only mode, each folder must contain:
 
 - Every numbered audio part for that book, such as `.mp3`, `.m4a`, `.aac`, `.wav`, `.flac`, or `.ogg`
-- A cover image named `cover.jpg`, `cover.jpeg`, `cover.png`, `folder.jpg`, `folder.jpeg`, or `folder.png`
-- A `metadata.json` file
+- A cover image named `cover.enriched.jpg`, `cover.jpg`, `cover.jpeg`, `cover.png`, `folder.jpg`, `folder.jpeg`, or `folder.png`
+- A `metadata.enriched.json` or `metadata.json` file
+
+For metadata mode, the folder name should be readable, ideally `Title by Author`.
 
 Example:
 
@@ -21,7 +27,7 @@ My Audiobooks/
     metadata.json
 ```
 
-The tool scans inside each audiobook folder recursively, so parts may be inside nested folders. A book is skipped if it is missing `metadata.json`, missing a supported cover image, or missing audio files.
+The tool scans inside each audiobook folder recursively, so parts may be inside nested folders. Conversion skips a book if it is missing metadata, missing a supported cover image, or missing audio files.
 
 ## 2. Run a Dry Run First
 
@@ -39,10 +45,31 @@ Run:
 python3 process_audiobooks_to_m4b.py "/path/to/My Audiobooks"
 ```
 
-Then choose:
+Then choose what you want to do:
 
 ```text
-1: Yes, start
+1: Add metadata only
+2: Convert to m4b only
+3: Add metadata, then convert to m4b
+4: Quit
+```
+
+Metadata mode uses Open Library, Google Books, and iTunes Audiobooks by default. It writes `metadata.enriched.json` and downloads missing cover art when a good match has a cover.
+
+If you choose metadata only or metadata plus conversion, the tool then asks:
+
+```text
+1: Supplement missing metadata only (keeps existing values)
+2: Fully overwrite and replace metadata
+3: Quit
+```
+
+Supplement mode keeps existing fields that already have values and fills blanks from provider results. Use it when you trust the current filled-in metadata. Replace mode rewrites `metadata.enriched.json` from the best provider match and writes `cover.enriched.jpg` when provider cover art is available.
+
+To also try Audible through an installed and authenticated Audible CLI:
+
+```bash
+python3 process_audiobooks_to_m4b.py "/path/to/My Audiobooks" --audible
 ```
 
 The dashboard shows total completed audiobooks and current per-book percentages.

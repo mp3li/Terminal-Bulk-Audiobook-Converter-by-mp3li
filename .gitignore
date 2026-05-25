@@ -38,7 +38,9 @@ dist/
 
 # Tool runtime state and partial conversions
 .m4b_batch_status.json
+.metadata_cache/
 *.partial.m4b
+*.concat.txt
 
 # Generated audiobook output
 *.m4b
